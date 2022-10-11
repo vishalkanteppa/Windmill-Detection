@@ -9,12 +9,12 @@ import sys, os
 import laspy
 import numpy as np
 import pandas as pd
+from functools import partial, reduce
 import logging
 import random
 import time
-import functools
 import matplotlib.pyplot as plt
-from pyspark.sql.types import StructType,StructField, FloatType, StringType
+from pyspark.sql.types import StructType,StructField, FloatType, StringType, IntegerType
 logger = spark._jvm.org.apache.log4j
 logging.getLogger("py4j.java_gateway").setLevel(logging.ERROR)
 sys.path.append('dbfs/mnt/lsde/datasets/ahn3/')
@@ -24,13 +24,12 @@ sys.path.append('dbfs/mnt/lsde/datasets/ahn3/')
 
 # COMMAND ----------
 
-schema = StructType([ \
-    StructField("x", FloatType(), True), \
-    StructField("y", FloatType(), True), \
-    StructField("classification", FloatType(), True), \
-    StructField("z", FloatType(), True), \
-    StructField("path", StringType(), True), \
-])
+def convert_mount_to_regular_path(mount_path):
+    mount_path_prefix = "dbfs:/"
+    if(not mount_path.path.startswith(mount_path_prefix)):
+        raise ValueError(f"didn't receive mount path: {mount_path}")
+    return "/dbfs/" + mount_path.path[len(mount_path_prefix):]
+
 def get_all_laz(dir):
     file_infos = dbutils.fs.ls(dir)
     laz_file_infos = []
@@ -42,62 +41,240 @@ def get_all_laz(dir):
             laz_file_infos.append(file_info)
     return laz_file_infos
 
-def convert_mount_to_regular_path(mount_path):
-    mount_path_prefix = "dbfs:/"
-    if(not mount_path.startswith(mount_path_prefix)):
-        raise ValueError(f"didn't receive mount path: {mount_path}")
-    return "/dbfs/" + mount_path[len(mount_path_prefix):]
+# ahn3_file_infos = get_all_laz("dbfs:/mnt/lsde/datasets/ahn3/")
+# ahn2_file_infos = get_all_laz("dbfs:/mnt/lsde/datasets/ahn2/")
 
+# COMMAND ----------
 
-def load_map(n_point_sample, n_chunk_iterator):
-    def _load_map(f_path):
-        xyz = np.empty((n_point_sample, 4), dtype=float)  
-        n_point_collected = 0
-        with laspy.open(f_path) as f:
-            for points in f.chunk_iterator(n_chunk_iterator):
-                start = n_point_collected
-                points_current = np.column_stack((points.x, points.y, points.classification))
-        print('-------',xyz)      
-        return [[*xyz, f_path] for xyz in xyz[:n_point_collected,:].tolist()]
-    return _load_map
+schema_1 = StructType([ \
+    StructField("x", FloatType(), True), \
+    StructField("y", FloatType(), True), \
+    StructField("z", FloatType(), True), \
+    StructField("path", StringType(), True), \
+])
+schema_2 = StructType([ \
+    StructField("X", IntegerType(), True), \
+    StructField("Y", IntegerType(), True), \
+    StructField("Z", IntegerType(), True), \
+    StructField("intensity", IntegerType(), True), \
+    StructField("bit_fields", IntegerType(), True), \
+    StructField("raw_classification", IntegerType(), True), \
+    StructField("scan_angle_rank", IntegerType(), True), \
+    StructField("user_data", IntegerType(), True), \
+    StructField("point_source_id", IntegerType(), True), \
+    StructField("gps_time", FloatType(), True), \
+    StructField("file_path", StringType(), True) \
+])
+ahn2_ahn3_factor = 41432/1375
+schemas = {
+    1: schema_1,
+    2: schema_2,
+}
 
-def create_df(file_infos, n_file_info=None, n_point_sample=10_000_000, n_chunk_iterator=2_000_000):
-    if(n_file_info):
-        file_infos_sampled = random.sample(file_infos, n_file_info)
+def load_map(f_path, n_point_sample, n_chunk_iterator, names):
+    dfs = []
+    with laspy.open(f_path) as f:
+        if n_point_sample > f.header.point_count:
+            n_point_sample = f.header.point_count
+        n_points_read = 0 
+        mask_offset = 0
+        sample = np.random.choice(f.header.point_count, n_point_sample, replace=False)
+        mask = np.full(f.header.point_count, False)
+        mask[sample] = True
+        for points in f.chunk_iterator(n_chunk_iterator):
+            current_mask = mask[n_points_read:n_points_read+len(points)]
+            df = pd.DataFrame(points.array[current_mask])
+            dfs.append(df)
+            n_points_read += len(points)
+            if(n_points_read >= n_point_sample):
+                break
+                
+    df = pd.concat(dfs, ignore_index=True, copy=False)
+    df['file_path'] = f_path
+    if not 'gps_time' in df.columns:
+        df['gps_time'] = pd.Series([], dtype='float64')
+    df = df[names]
+    return df.to_numpy().tolist()
+
+def create_df(f_paths, schema, n_f_paths, n_point_sample, n_chunk_iterator):
+    if(n_f_paths):
+        f_paths_sampled = random.sample(f_paths, n_f_paths)
     else:
-        file_infos_sampled = file_infos
-    files_rdd = sc.parallelize([convert_mount_to_regular_path(file_info.path) for file_info in file_infos_sampled])
-    points_rdd = files_rdd.flatMap(load_map(n_point_sample, n_chunk_iterator))
+        f_paths_sampled = f_paths
+    files_rdd = sc.parallelize([convert_mount_to_regular_path(f_path) for f_path in f_paths_sampled])
+    points_rdd = files_rdd.flatMap(partial(load_map, n_point_sample=n_point_sample, n_chunk_iterator=n_chunk_iterator, names=schema.names))
     df_points = spark.createDataFrame(points_rdd, schema)
-
     return df_points
 
 
-def get_data_from_file(ahn,file_names,n_files=10):
-    file_names=random.sample(file_names,n_files)
-    for file in file_names:
-        
+def create_and_store_or_load_df(which, f_paths, n_f_paths, n_point_sample, n_chunk_iterator, schema=2):
+    df_points_path = f"/mnt/lsde/group02/df_points_{which}_files-{n_f_paths}_samples-{n_point_sample}_schema-{schema}.parquet"
+    try:
+        dbutils.fs.ls(df_points_path)
+    except Exception as err:
+        df_points = create_df(f_paths, schemas[schema], n_f_paths, n_point_sample, n_chunk_iterator)
+        df_points.write.parquet(df_points_path)
+        return df_points
+    df_points = spark.read.parquet(df_points_path)
+    return df_points
+
+def create_and_store_df(which, f_paths, n_f_paths, n_point_sample, n_chunk_iterator, schema=2):
+    df_points_path = f"/mnt/lsde/group04/{which}_files-{n_f_paths}_no_of_samples-{n_point_sample}-{schema}.parquet"
+    df_points = create_df(f_paths, schemas[schema], n_f_paths, n_point_sample, n_chunk_iterator)
+    df_points.write.mode("overwrite").parquet(df_points_path)
+    df_points = spark.read.parquet(df_points_path)
+    return df_points
+
+def create_and_store_or_load_dfs(ahn2_f_paths, ahn3_f_paths, n_f_paths, n_point_sample=10_000_000, n_chunk_iterator=2_000_000):
+    start_time = time.time()
+#     df_points_ahn2 = create_and_store_or_load_df("ahn2", ahn2_f_paths, n_f_paths, n_point_sample, n_chunk_iterator)
+#     df_points_ahn3 = create_and_store_or_load_df("ahn3", ahn3_f_paths, n_f_paths, n_point_sample, n_chunk_iterator)
+    df_points_ahn2 = create_and_store_df("ahn2", ahn2_f_paths, int(n_f_paths * ahn2_ahn3_factor), int(n_point_sample / ahn2_ahn3_factor), n_chunk_iterator)
+    df_points_ahn3 = create_and_store_df("ahn3", ahn3_f_paths, n_f_paths, n_point_sample, n_chunk_iterator)
+    end_time = time.time()
+    print(f"took {end_time - start_time:.2f} for n_f_paths={n_f_paths} n_point_sample={n_point_sample}")  # this isn't very accurate/comparable if loading from disk
+    return df_points_ahn2, df_points_ahn3
+
+# COMMAND ----------
+
 ahn3_file_infos = get_all_laz("dbfs:/mnt/lsde/datasets/ahn3/")
 ahn2_file_infos = get_all_laz("dbfs:/mnt/lsde/datasets/ahn2/")
 
+# COMMAND ----------
 
+df_points_ahn2_1, df_points_ahn3_1 = create_and_store_or_load_dfs(ahn2_file_infos, ahn3_file_infos, 120)
+# df_points_ahn2_1.describe().show(), df_points_ahn3_1.describe().show()
 
 # COMMAND ----------
 
-ahn2_file_infos = get_all_laz("dbfs:/mnt/lsde/datasets/ahn2/")
+df_points_ahn2_1.describe().show(), df_points_ahn3_1.describe().show()
+
+# COMMAND ----------
+
+def convert(file):
+    image=laspy.read(file)
+    return image.X
+
+# COMMAND ----------
+
+file=random.choice(ahn2_file_infos)
+file2=random.choice(ahn2_file_infos)
+print(file)
 files_rdd = sc.parallelize([convert_mount_to_regular_path(file_info.path) for file_info in ahn2_file_infos])
-points_rdd = files_rdd.flatMap(load_map(10000000, 2500000))
 
+image2=laspy.read(convert_mount_to_regular_path(file2.path))
+data=sc.parallelize(np.stack([image2.X, image2.Y, image2.Z, image2.classification], axis=0).transpose((1, 0)))
 
+for file in files_rdd.collect():
+    image=laspy.read(file)
+    temp=sc.parallelize(np.stack([image.X, image.Y, image.Z, image.classification], axis=0).transpose((1, 0)))
+    data=data.union(temp)
+# image=laspy.read(convert_mount_to_regular_path(file.path))
+# temp=sc.parallelize(np.stack([image.X, image.Y, image.Z, image.classification], axis=0).transpose((1, 0)))
+# data=data.union(temp)
+# data.collect()    
+
+    
+    
+# temp = files_rdd.map(lambda x: convert(x))
+
+    
 
 # COMMAND ----------
 
-points_rdd.collect()
+data.collect()
+
+# COMMAND ----------
+
+a=[[1,2],[3,4],[10,11]]
+b=[[5,6],[7,8]]
+a=sc.parallelize(a)
+b=sc.parallelize(b)
+a=a.union(b)
+a.collect()
+
+# COMMAND ----------
+
+def get_data_from_file(file_path,n_files=10):
+#     file_names=random.sample(file_names,n_files)
+#     data=[]
+    image=laspy.read(file_path)
+    print('-----',image)
+    point_data = np.stack([image.X, image.Y, image.Z, image.classification], axis=0).transpose((1, 0))
+    return point_data
+    
+#     for file in file_names:
+#         print(file.path)
+#         try:
+#             image=laspy.read(file.path)
+#         except Exception as e:
+#             print(e)
+#             return
+#         point_data = np.stack([image.X, image.Y, image.Z, image.classification], axis=0).transpose((1, 0))
+#     print(point_data)
+
+file_paths = []
+n_files=10
+
+n_file_info = random.sample(ahn2_file_infos,n_files)
+for file in n_file_info:
+    file_paths.append(convert_mount_to_regular_path(file.path))
+
+file_rdd = sc.parallelize(file_paths)
+# print(file_rdd.collect())
+points_rdd = file_rdd.flatMap(load_map(n_point_sample=n_point_sample, n_chunk_iterator=n_chunk_iterator))
+
+
+# get_data_from_file(ahn2_file_infos)
+
+# COMMAND ----------
+
+df_points = spark.createDataFrame(x, schema_1)
+df_points.write.mode("overwrite").parquet('/mnt/lsde/group04/test.parquet')
+test=spark.read.parquet("/mnt/lsde/group04/test.parquet")
+print(test)
+
+# COMMAND ----------
+
+n_point_sample = 2_000_000
+n_chunk_iterator = 1_000_000
+dtype = [('X', '<i4'), ('Y', '<i4'), ('Z', '<i4'), ('intensity', '<u2'), ('bit_fields', 'u1'), ('raw_classification', 'u1'), ('scan_angle_rank', 'i1'), ('user_data', 'u1'), ('point_source_id', '<u2'), ('gps_time', '<f8')]
+xyz = np.empty(n_point_sample, dtype=dtype)  # we might not completely fill up this xyz if our sample is larger than the number of points in the current file
+n_point_collected = 0
+f_path = '/dbfs/mnt/lsde/datasets/ahn2/tileslaz/tile_0_2/ahn_017000_363000.laz'
+with laspy.open(f_path) as f:
+    # im not sure how points are stored within a laz file e.g. all points with low height first which would make this sample kinda biased
+    # we could do some math to figure out how much per chunk we need if we think this is important
+    # we need this chunk iterator as the workers seems to crash quite often due to running out of memory otherwise
+    for points in f.chunk_iterator(n_chunk_iterator):
+        start = n_point_collected
+        n_point_collected += len(points)
+        
+        if not 'gps_time' in [dim.name for dim in points.point_format.dimensions]:
+            print(type(f))
+            print(type(f.chunk_iterator))
+            print(type(points))
+#             points.add_extra_dim(laspy.ExtraBytesParams(name="gps_time", type="<f8"))
+        print('---------')
+        print(f.chunk_iterator)
+        points_current = points.array
+        print(points_current.dtype)
+        # I dont think we actually need all this logic if n_point_sample is a multiple of n_chunk_iterator but it seemed more natural to not make them dependent
+        if n_point_collected > n_point_sample:
+            leftover = (n_point_sample % n_chunk_iterator)
+            xyz[start:(start + leftover)] = points_current[:leftover]
+            break
+        else:
+            leftover = (n_point_collected % n_chunk_iterator)
+            leftover = n_chunk_iterator if leftover == 0 else leftover
+#             xyz[start:(start + leftover)] = points_current
+
+print([[*xyz, f_path] for xyz in xyz[:n_point_collected].tolist()])
 
 # COMMAND ----------
 
 def create_and_store_or_load_df(which, file_infos, n_file_info, n_point_sample, n_chunk_iterator):
-    df_points_path = f"/mnt/lsde/group02/df_points_{which}_files-{n_file_info}_samples-{n_point_sample}.parquet"
+    df_points_path = f"/mnt/lsde/group04/test.parquet"
     try:
 #       check if file exists
         dbutils.fs.ls(df_points_path)
@@ -105,8 +282,8 @@ def create_and_store_or_load_df(which, file_infos, n_file_info, n_point_sample, 
         df_points = create_df(file_infos, n_file_info, n_point_sample, n_chunk_iterator)
         df_points.write.mode("overwrite").parquet(df_points_path)
         return df_points
-
-    df_points = spark.read.parquet(df_points_path)
+    df_points = spark.read.parquet(df_points_path,schema_2)
+    print(df_points)
     return df_points
 
 def create_and_store_or_load_dfs(ahn2_file_infos, ahn3_file_infos, n_file_info, n_point_sample=10_000_000, n_chunk_iterator=2_500_000):
@@ -119,8 +296,9 @@ def create_and_store_or_load_dfs(ahn2_file_infos, ahn3_file_infos, n_file_info, 
 
 # COMMAND ----------
 
+
 df_points_ahn2_1, df_points_ahn3_1 = create_and_store_or_load_dfs(ahn2_file_infos, ahn3_file_infos, 10)
-# df_points_ahn2_1.describe().show(), df_points_ahn3_1.show()
+df_points_ahn2_1.describe().show(), df_points_ahn3_1.show()
 
 # COMMAND ----------
 
@@ -130,25 +308,6 @@ print(ax)
 column = 'classification'
 df_list=list(df_points_ahn2_1.select(column).toPandas()[column])
 # print(df_list)
-
-
-# COMMAND ----------
-
-# sd_sum=0
-# m_sum=0
-# for i in df_list:
-#     m_sum=m_sum+i
-# mean=m_sum/len(df_list)
-
-# for i in df_list:
-#     sd_sum=sd_sum+(i-mean)**2
-# sd=(sd_sum/len(df_list))**.5
-# print(sd,mean)
-
-# for i in range(len(df_list)):
-# #     df_list[i]=(df_list[i]-mean)/sd
-#     df_list[i] = ((1 / (np.sqrt(2 * np.pi) * sd)) * np.exp(-0.5 * ((1 / sd )* (df_list[i] - mean))**2))
-
 
 
 # COMMAND ----------
